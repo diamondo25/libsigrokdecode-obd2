@@ -57,6 +57,7 @@ class Decoder(srd.Decoder):
     binary = (
         ('tester', 'Tester requests'),
         ('device', 'Device responses'),
+        ('dump', 'TSV formatted dump'),
     )
 
 
@@ -71,6 +72,7 @@ class Decoder(srd.Decoder):
         self.es_block = None
         self.frame_start = None
         self.frame_end = None
+        self.tsv_header = False
 
     def start(self):
         self.out_ann = self.register(srd.OUTPUT_ANN)
@@ -100,8 +102,10 @@ class Decoder(srd.Decoder):
         elif bytes_received == 2:
             self.frame_start = self.ss_block
             self.putx([1, ['Destination (%02X)' % (value), 'Destination', 'Dest']])
+            self.destination_id = value
         elif bytes_received == 3:
             self.putx([1, ['Source (%02X)' % (value), 'Source', 'Src']])
+            self.source_id = value
         else:
             self.putx([1, ['Data  (%02X)' % (value), 'Data', 'Data']])
         
@@ -109,11 +113,14 @@ class Decoder(srd.Decoder):
             self.frame_end = self.es_block
             self.fsm.transit(KlineFsm.State.Checksum)
 
+    def print_tsv(self, fields):
+        dump_text = '\t'.join(fields) + "\n"
+        self.put(self.frame_start, self.es_block, self.out_binary, [2, dump_text.encode()])
 
     def handle_checksum(self, value):
         self.putx([1, ['Checksum  (%02X)' % (value), 'Checksum', 'Chksum']])
 
-        is_tester_request = self.frame[1] >= 0xF0 and self.frame[1] <= 0xFD
+        is_tester_request = self.source_id >= 0xF0 and self.source_id <= 0xFD
 
         valid_checksum = self.checksum_is_valid(self.frame, value)
         if not valid_checksum:
@@ -122,15 +129,38 @@ class Decoder(srd.Decoder):
         else:
             # Broadcast this data
             self.put(self.frame_start, self.frame_end, self.out_python, {
-                'dest': self.frame[0],
-                'src': self.frame[1],
+                'dest': self.destination_id,
+                'src': self.source_id,
                 'data': self.frame[2:]
             })
 
         # Broadcast full frame to binary decoders
         self.put(self.frame_start, self.es_block, self.out_binary, 
                  [0 if is_tester_request else 1, bytes(self.frame)])
+        
+        hexdump = ''
+        for b in self.frame[3:]:
+            hexdump += '%02X ' % (b)
+        
+        if not self.tsv_header:
+            self.tsv_header = True
+            
+            self.print_tsv([
+                'Name',
+                'Source device ID',
+                'Destination device ID',
+                'Frame data',
+                'Checksum'
+            ])
 
+        self.print_tsv([
+            'Tester' if is_tester_request else 'Device',
+            '%02X' % self.source_id,
+            '%02X' % self.destination_id,
+            hexdump,
+            'Valid' if valid_checksum else 'Invalid'
+        ])
+        
         self.frame.clear()
         self.fsm.transit(KlineFsm.State.Header)
 
